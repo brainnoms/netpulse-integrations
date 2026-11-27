@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -14,7 +17,7 @@ import (
 	"github.com/gnacho/netpulse/agent/probe"
 )
 
-var Version = "0.2.0"
+var Version = "0.3.0"
 
 func run(ctx context.Context) error {
 	cfg, err := pusher.ConfigFromEnv("gfiber-pusher", Version)
@@ -33,6 +36,16 @@ func run(ctx context.Context) error {
 		SessionPingURL:  envOr("GFIBER_SESSION_PING_URL", "https://gfiber.com/account"),
 	})
 
+	// Autoheal: a session death (401/403) triggers a headless Auth0 OTP
+	// re-mint with the code read straight from Gmail — no human relay.
+	// Unconfigured (no account e-mail or no Google credentials) is a
+	// supported state: the pusher keeps the honest-401 + watchdog model.
+	healer, err := newHealer(cookieFile)
+	if err != nil {
+		slog.Warn("gfiber-pusher: autoheal disabled", "reason", err)
+		healer = nil
+	}
+
 	// One portal poll feeds N fleet rows: the gateway (cfg.Slug/cfg.Token)
 	// plus one row per mesh extender, each with its own agent token from
 	// GFIBER_TOKEN_<SLUG uppercased, dashes to underscores>. Rows without a
@@ -43,6 +56,12 @@ func run(ctx context.Context) error {
 	missed := map[string]bool{}
 	for {
 		data, err := poller.Poll(ctx)
+		var se *gfiber.SessionError
+		if err != nil && errors.As(err, &se) && healer != nil {
+			if healer.MaybeMint(ctx, poller, se) {
+				data, err = poller.Poll(ctx) // healed: retry the cycle now
+			}
+		}
 		if err != nil {
 			slog.Error("gfiber-pusher: collection failed", "err", err)
 		} else {
@@ -122,6 +141,53 @@ func parseClients(s string) map[string][]string {
 		return nil
 	}
 	return out
+}
+
+// newHealer assembles the autoheal pipeline from the environment. It
+// returns a descriptive error (not a half-wired healer) when the feature
+// is not configured:
+//
+//	GFIBER_ACCOUNT_EMAIL        the portal account (enables autoheal)
+//	GFIBER_GOOGLE_FILE          OAuth JSON + refresh token (~/.secrets/…)
+//	GFIBER_GMAIL_QUERY          Gmail search override for the code e-mail
+//	GFIBER_LOGIN_URL            login entry that mints a fresh transaction
+//	GFIBER_AUTOHEAL_LEDGER      CSV to append heal rows to (watchdog ledger)
+//	GFIBER_REMINT_MIN_INTERVAL  Auth0 rate guard, default 30m
+func newHealer(cookieFile string) (*gfiber.Heal, error) {
+	email := strings.TrimSpace(os.Getenv("GFIBER_ACCOUNT_EMAIL"))
+	if email == "" {
+		return nil, errors.New("GFIBER_ACCOUNT_EMAIL not set")
+	}
+	googleFile := strings.TrimSpace(os.Getenv("GFIBER_GOOGLE_FILE"))
+	if googleFile == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			googleFile = filepath.Join(home, ".secrets", "netpulse_gfiber_google.json")
+		}
+	}
+	creds, err := gfiber.LoadGoogleCreds(googleFile)
+	if err != nil {
+		return nil, err
+	}
+	gmail := gfiber.NewGmail(creds)
+	if q := strings.TrimSpace(os.Getenv("GFIBER_GMAIL_QUERY")); q != "" {
+		gmail.Query = q
+	}
+	minInterval, err := time.ParseDuration(envOr("GFIBER_REMINT_MIN_INTERVAL", "30m"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid GFIBER_REMINT_MIN_INTERVAL: %w", err)
+	}
+	auth0 := gfiber.NewAuth0(gfiber.Auth0Config{
+		LoginURL: envOr("GFIBER_LOGIN_URL", "https://gfiber.com/account/auth/login?returnTo=%2Faccount%2F"),
+		Email:    email,
+		Fetcher:  gmail,
+	}, nil)
+	slog.Info("gfiber-pusher: autoheal armed", "email", email, "min_interval", minInterval, "ledger", os.Getenv("GFIBER_AUTOHEAL_LEDGER"))
+	return &gfiber.Heal{
+		Mint:        auth0.Mint,
+		CookieFile:  cookieFile,
+		LedgerFile:  strings.TrimSpace(os.Getenv("GFIBER_AUTOHEAL_LEDGER")),
+		MinInterval: minInterval,
+	}, nil
 }
 
 func main() {

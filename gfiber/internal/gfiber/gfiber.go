@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gnacho/netpulse/agent/probe"
@@ -67,12 +68,26 @@ type Config struct {
 	HTTPClient *http.Client
 }
 
+// SessionError reports a portal rejection that only a fresh login can cure:
+// measured deaths arrive as 401 or 403 on the RPCs. The pusher loop treats
+// it as the autoheal trigger; every other failure is a transient vendor
+// problem the next cycle rides out.
+type SessionError struct {
+	Path string
+	Code int
+}
+
+func (e *SessionError) Error() string {
+	return fmt.Sprintf("gfiber: %s: session expired (HTTP %d): re-run the one-time-code login or let autoheal re-mint", e.Path, e.Code)
+}
+
 type Poller struct {
 	base  string
 	cfg   Config
 	http  *http.Client
 	log   *slog.Logger
-	units []Unit // last successful extender decode, for per-row pushes
+	units []Unit        // last successful extender decode, for per-row pushes
+	rpcs  atomic.Uint64 // successful portal RPCs since the last re-mint (ledger signal)
 }
 
 func New(cfg Config, loggers ...*slog.Logger) *Poller {
@@ -192,6 +207,13 @@ type Unit struct {
 // Units returns the extender rows from the most recent successful Poll
 // (nil until the first poll has decoded the roster).
 func (p *Poller) Units() []Unit { return p.units }
+
+// RPCs counts successful portal RPC calls since the last ResetRPCs — the
+// "endpoint count" a re-mint row records about the session it replaces.
+func (p *Poller) RPCs() uint64 { return p.rpcs.Load() }
+
+// ResetRPCs zeroes the counter and returns the value it held.
+func (p *Poller) ResetRPCs() uint64 { return p.rpcs.Swap(0) }
 
 // ---- client ----
 
@@ -341,11 +363,12 @@ func (p *Poller) get(ctx context.Context, path string, out any) error {
 	defer res.Body.Close()
 	p.persistCookies(res)
 	switch {
-	case res.StatusCode == http.StatusUnauthorized:
-		return fmt.Errorf("gfiber: %s: session expired (401): re-run the one-time-code login and refresh the cookie file", path)
+	case res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden:
+		return &SessionError{Path: path, Code: res.StatusCode}
 	case res.StatusCode != http.StatusOK:
 		return fmt.Errorf("gfiber: %s: HTTP %d", path, res.StatusCode)
 	}
+	p.rpcs.Add(1)
 	body, err := io.ReadAll(io.LimitReader(res.Body, 2<<20))
 	if err != nil {
 		return fmt.Errorf("gfiber: %s: read: %w", path, err)
