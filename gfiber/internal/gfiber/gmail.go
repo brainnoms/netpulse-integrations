@@ -115,7 +115,8 @@ func (g *Gmail) LatestCode(ctx context.Context, notBefore time.Time) (string, er
 	q := fmt.Sprintf(`%s newer_than:%dm`, g.Query, mins)
 	var list struct {
 		Messages []struct {
-			ID string `json:"id"`
+			ID           string `json:"id"`
+			InternalDate string `json:"internalDate"`
 		} `json:"messages"`
 	}
 	if err := g.apiGet(ctx, tok, "/gmail/v1/users/me/messages",
@@ -125,8 +126,35 @@ func (g *Gmail) LatestCode(ctx context.Context, notBefore time.Time) (string, er
 	if len(list.Messages) == 0 {
 		return "", nil
 	}
-	// messages.list answers newest-first; still verify the timestamp —
-	// a previous episode's unread code must not be replayed.
+	// Never trust messages.list ordering: date-sorted (newer_than) answers
+	// carry no documented direction, and after a resend two codes sit in
+	// the window — only the newest still verifies at Auth0. Pick by
+	// internalDate among messages at or after notBefore; a previous
+	// episode's unread code is filtered by that same bound.
+	chosen := ""
+	var chosenAt time.Time
+	first := ""
+	for _, m := range list.Messages {
+		if first == "" {
+			first = m.ID
+		}
+		stamp, err := strconv.ParseInt(m.InternalDate, 10, 64)
+		if err != nil {
+			continue
+		}
+		at := time.UnixMilli(stamp)
+		if at.Before(notBefore) {
+			continue
+		}
+		if chosen == "" || at.After(chosenAt) {
+			chosen, chosenAt = m.ID, at
+		}
+	}
+	if chosen == "" {
+		// No parseable date (thin stub answers): fall back to the first
+		// hit and let the full-message timestamp guard below decide.
+		chosen = first
+	}
 	var msg struct {
 		InternalDate string `json:"internalDate"`
 		Snippet      string `json:"snippet"`
@@ -143,7 +171,7 @@ func (g *Gmail) LatestCode(ctx context.Context, notBefore time.Time) (string, er
 			} `json:"parts"`
 		} `json:"payload"`
 	}
-	if err := g.apiGet(ctx, tok, "/gmail/v1/users/me/messages/"+list.Messages[0].ID,
+	if err := g.apiGet(ctx, tok, "/gmail/v1/users/me/messages/"+chosen,
 		url.Values{"format": {"full"}}, &msg); err != nil {
 		return "", err
 	}

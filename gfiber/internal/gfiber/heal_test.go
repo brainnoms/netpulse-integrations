@@ -366,6 +366,68 @@ func TestLoadGoogleCredsShapes(t *testing.T) {
 	}
 }
 
+// TestGmailPicksNewestCode pins ordering independence: a resend leaves two
+// codes in the window, and a date-sorted messages.list answer carries no
+// guaranteed direction — the newest matching code must win even when the
+// stub returns it last, and the loser must not be fetched in full.
+func TestGmailPicksNewestCode(t *testing.T) {
+	old := time.Now().Add(-3 * time.Minute).UnixMilli()
+	fresh := time.Now().Add(-30 * time.Second).UnixMilli()
+	var fullFetched []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"access_token":"tok","expires_in":3600}`))
+	})
+	mux.HandleFunc("/gmail/v1/users/me/messages", func(w http.ResponseWriter, r *http.Request) {
+		// Oldest-first on purpose: the pre-fix code took this one.
+		w.Write([]byte(fmt.Sprintf(
+			`{"messages":[{"id":"m-old","internalDate":"%d"},{"id":"m-new","internalDate":"%d"}]}`, old, fresh)))
+	})
+	mux.HandleFunc("/gmail/v1/users/me/messages/", func(w http.ResponseWriter, r *http.Request) {
+		fullFetched = append(fullFetched, r.URL.Path)
+		code := "111111"
+		if strings.HasSuffix(r.URL.Path, "m-new") {
+			code = "222222"
+		}
+		w.Write([]byte(fmt.Sprintf(`{"internalDate":"%d","snippet":"your code %s"}`, fresh, code)))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	g := NewGmail(GoogleCreds{ClientID: "c", ClientSecret: "s", RefreshToken: "r"})
+	g.TokenURL = srv.URL + "/token"
+	g.APIBase = srv.URL
+	code, err := g.LatestCode(context.Background(), time.Now().Add(-10*time.Minute))
+	if err != nil || code != "222222" {
+		t.Fatalf("newest code must win: %q %v", code, err)
+	}
+	if len(fullFetched) != 1 || !strings.HasSuffix(fullFetched[0], "m-new") {
+		t.Fatalf("only the winner may be fetched in full: %v", fullFetched)
+	}
+}
+
+// TestGmailSnippetCode covers the snippet-first extraction seam (no body).
+func TestGmailSnippetCode(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"access_token":"tok","expires_in":3600}`))
+	})
+	mux.HandleFunc("/gmail/v1/users/me/messages", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"messages":[{"id":"m1"}]}`))
+	})
+	mux.HandleFunc("/gmail/v1/users/me/messages/m1", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(fmt.Sprintf(`{"internalDate":"%d","snippet":"Enter 649330 to sign in"}`, time.Now().UnixMilli())))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	g := NewGmail(GoogleCreds{ClientID: "c", ClientSecret: "s", RefreshToken: "r"})
+	g.TokenURL = srv.URL + "/token"
+	g.APIBase = srv.URL
+	code, err := g.LatestCode(context.Background(), time.Now().Add(-2*time.Minute))
+	if err != nil || code != "649330" {
+		t.Fatalf("snippet extraction: %q %v", code, err)
+	}
+}
+
 func TestFmtAge(t *testing.T) {
 	for d, want := range map[time.Duration]string{
 		2*time.Hour + 35*time.Minute:  "2h35m",

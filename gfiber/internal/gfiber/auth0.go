@@ -223,10 +223,13 @@ func (a *Auth0) awaitCode(ctx context.Context, client *http.Client, chalURL, sta
 				}
 				a.log.Warn("gfiber: code resend failed", "err", rerr)
 			}
+			// Report the window actually waited — the resend-at-tick path
+			// times out at PollMax, not after two full windows.
+			waited := time.Since(sendAt).Truncate(time.Second)
 			if lastErr != nil {
-				return "", fmt.Errorf("gfiber: no one-time code within %v (last gmail error: %w)", 2*a.cfg.PollMax, lastErr)
+				return "", fmt.Errorf("gfiber: no one-time code within %v (last gmail error: %w)", waited, lastErr)
 			}
-			return "", fmt.Errorf("gfiber: no one-time code within %v of the request", 2*a.cfg.PollMax)
+			return "", fmt.Errorf("gfiber: no one-time code within %v of the request", waited)
 		case <-tick.C:
 			if !resent && time.Since(sendAt) >= a.cfg.ResendAt {
 				resent = true
